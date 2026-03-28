@@ -22,7 +22,15 @@ func main() {
 		os.Exit(1)
 	}
 
-	p := tea.NewProgram(newModel(db, tasks), tea.WithAltScreen())
+	hidden, err := loadHiddenCommits(db)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error loading hidden commits: %v\n", err)
+		os.Exit(1)
+	}
+
+	commits := loadCommits(hidden, false)
+
+	p := tea.NewProgram(newModel(db, tasks, commits, hidden), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)

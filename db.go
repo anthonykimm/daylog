@@ -11,7 +11,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const currentSchemaVersion = 1
+const currentSchemaVersion = 2
 
 type Task struct {
 	ID        int
@@ -46,8 +46,7 @@ func migrate(db *sql.DB) error {
 		return err
 	}
 
-	switch version {
-	case 0:
+	if version < 1 {
 		_, err := db.Exec(`
 			CREATE TABLE IF NOT EXISTS tasks (
 				id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,9 +59,24 @@ func migrate(db *sql.DB) error {
 		if err != nil {
 			return err
 		}
-	case currentSchemaVersion:
-		// up to date
-	default:
+		version = 1
+	}
+
+	if version < 2 {
+		_, err := db.Exec(`
+			CREATE TABLE IF NOT EXISTS hidden_commits (
+				hash TEXT PRIMARY KEY,
+				hidden_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+			);
+			PRAGMA user_version = 2;
+		`)
+		if err != nil {
+			return err
+		}
+		version = 2
+	}
+
+	if version > currentSchemaVersion {
 		return fmt.Errorf("unknown schema version %d (expected <=%d)", version, currentSchemaVersion)
 	}
 
@@ -124,4 +138,32 @@ func loadTasksForDate(db *sql.DB, date time.Time) ([]Task, error) {
 		tasks = append(tasks, t)
 	}
 	return tasks, rows.Err()
+}
+
+func hideCommit(db *sql.DB, hash string) error {
+	_, err := db.Exec("INSERT OR IGNORE INTO hidden_commits (hash) VALUES (?)", hash)
+	return err
+}
+
+func unhideCommit(db *sql.DB, hash string) error {
+	_, err := db.Exec("DELETE FROM hidden_commits WHERE hash = ?", hash)
+	return err
+}
+
+func loadHiddenCommits(db *sql.DB) (map[string]bool, error) {
+	rows, err := db.Query("SELECT hash FROM hidden_commits")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	hidden := make(map[string]bool)
+	for rows.Next() {
+		var hash string
+		if err := rows.Scan(&hash); err != nil {
+			return nil, err
+		}
+		hidden[hash] = true
+	}
+	return hidden, rows.Err()
 }

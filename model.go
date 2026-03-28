@@ -15,6 +15,9 @@ var (
 	dimBorderColor = lipgloss.Color("8")
 	selectedStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
 	doneStyle      = lipgloss.NewStyle().Strikethrough(true).Foreground(lipgloss.Color("8"))
+	commitStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
+	hiddenStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Italic(true)
+	dividerStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	helpStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 )
 
@@ -25,29 +28,41 @@ const (
 	modeInput
 )
 
-type model struct {
-	db         *sql.DB
-	tasks      []Task
-	pane       int // 0 = task, 1 = done
-	taskCursor int
-	doneCursor int
-	mode       mode
-	input      textinput.Model
-	width      int
-	height     int
-	err        error
-	quitting   bool
+// doneItem represents an item in the Done pane's unified list.
+type doneItem struct {
+	isCommit bool
+	task     Task   // populated if !isCommit
+	commit   Commit // populated if isCommit
 }
 
-func newModel(db *sql.DB, tasks []Task) model {
+type model struct {
+	db            *sql.DB
+	tasks         []Task
+	commits       []Commit
+	hiddenCommits map[string]bool
+	showHidden    bool
+	pane          int // 0 = task, 1 = done
+	taskCursor    int
+	doneCursor    int
+	mode          mode
+	input         textinput.Model
+	width         int
+	height        int
+	err           error
+	quitting      bool
+}
+
+func newModel(db *sql.DB, tasks []Task, commits []Commit, hidden map[string]bool) model {
 	ti := textinput.New()
 	ti.Placeholder = "New task..."
 	ti.CharLimit = 256
 
 	return model{
-		db:    db,
-		tasks: tasks,
-		input: ti,
+		db:            db,
+		tasks:         tasks,
+		commits:       commits,
+		hiddenCommits: hidden,
+		input:         ti,
 	}
 }
 
@@ -71,6 +86,19 @@ func (m model) completedTasks() []Task {
 	return out
 }
 
+// doneItems builds the unified list for the Done pane:
+// completed tasks, then visible commits.
+func (m model) doneItems() []doneItem {
+	var items []doneItem
+	for _, t := range m.completedTasks() {
+		items = append(items, doneItem{task: t})
+	}
+	for _, c := range m.commits {
+		items = append(items, doneItem{isCommit: true, commit: c})
+	}
+	return items
+}
+
 func (m model) findTaskIndex(id int) int {
 	for i, t := range m.tasks {
 		if t.ID == id {
@@ -78,6 +106,20 @@ func (m model) findTaskIndex(id int) int {
 		}
 	}
 	return -1
+}
+
+func (m *model) refreshCommits() {
+	m.commits = loadCommits(m.hiddenCommits, m.showHidden)
+}
+
+func (m *model) clampDoneCursor() {
+	items := m.doneItems()
+	if m.doneCursor >= len(items) {
+		m.doneCursor = len(items) - 1
+	}
+	if m.doneCursor < 0 {
+		m.doneCursor = 0
+	}
 }
 
 func (m model) Init() tea.Cmd {
@@ -102,7 +144,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	pending := m.pendingTasks()
-	done := m.completedTasks()
+	items := m.doneItems()
 
 	switch msg.String() {
 	case "q", "ctrl+c":
@@ -125,7 +167,7 @@ func (m model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "down", "j":
 		if m.pane == 0 && m.taskCursor < len(pending)-1 {
 			m.taskCursor++
-		} else if m.pane == 1 && m.doneCursor < len(done)-1 {
+		} else if m.pane == 1 && m.doneCursor < len(items)-1 {
 			m.doneCursor++
 		}
 
@@ -135,6 +177,17 @@ func (m model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.input.Reset()
 		m.input.Focus()
 		return m, m.input.Cursor.BlinkCmd()
+
+	case "r":
+		m.refreshCommits()
+		m.clampDoneCursor()
+
+	case "u":
+		if m.pane == 1 {
+			m.showHidden = !m.showHidden
+			m.refreshCommits()
+			m.clampDoneCursor()
+		}
 
 	case " ", "enter":
 		if m.pane == 0 && len(pending) > 0 {
@@ -148,16 +201,28 @@ func (m model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.taskCursor >= len(pending)-1 && m.taskCursor > 0 {
 				m.taskCursor--
 			}
-		} else if m.pane == 1 && len(done) > 0 {
-			task := done[m.doneCursor]
-			idx := m.findTaskIndex(task.ID)
-			if err := toggleTask(m.db, task.ID); err != nil {
-				m.err = err
-				return m, nil
-			}
-			m.tasks[idx].Completed = false
-			if m.doneCursor >= len(done)-1 && m.doneCursor > 0 {
-				m.doneCursor--
+		} else if m.pane == 1 && len(items) > 0 {
+			item := items[m.doneCursor]
+			if item.isCommit {
+				// Enter on a hidden commit restores it
+				if item.commit.Hidden {
+					if err := unhideCommit(m.db, item.commit.Hash); err != nil {
+						m.err = err
+						return m, nil
+					}
+					delete(m.hiddenCommits, item.commit.Hash)
+					m.refreshCommits()
+					m.clampDoneCursor()
+				}
+			} else {
+				// Toggle completed task back to pending
+				idx := m.findTaskIndex(item.task.ID)
+				if err := toggleTask(m.db, item.task.ID); err != nil {
+					m.err = err
+					return m, nil
+				}
+				m.tasks[idx].Completed = false
+				m.clampDoneCursor()
 			}
 		}
 
@@ -173,16 +238,26 @@ func (m model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.taskCursor >= len(pending)-1 && m.taskCursor > 0 {
 				m.taskCursor--
 			}
-		} else if m.pane == 1 && len(done) > 0 {
-			task := done[m.doneCursor]
-			idx := m.findTaskIndex(task.ID)
-			if err := deleteTask(m.db, task.ID); err != nil {
-				m.err = err
-				return m, nil
-			}
-			m.tasks = append(m.tasks[:idx], m.tasks[idx+1:]...)
-			if m.doneCursor >= len(done)-1 && m.doneCursor > 0 {
-				m.doneCursor--
+		} else if m.pane == 1 && len(items) > 0 {
+			item := items[m.doneCursor]
+			if item.isCommit {
+				if !item.commit.Hidden {
+					if err := hideCommit(m.db, item.commit.Hash); err != nil {
+						m.err = err
+						return m, nil
+					}
+					m.hiddenCommits[item.commit.Hash] = true
+					m.refreshCommits()
+					m.clampDoneCursor()
+				}
+			} else {
+				idx := m.findTaskIndex(item.task.ID)
+				if err := deleteTask(m.db, item.task.ID); err != nil {
+					m.err = err
+					return m, nil
+				}
+				m.tasks = append(m.tasks[:idx], m.tasks[idx+1:]...)
+				m.clampDoneCursor()
 			}
 		}
 	}
@@ -224,7 +299,7 @@ func (m model) View() string {
 	}
 
 	pending := m.pendingTasks()
-	done := m.completedTasks()
+	items := m.doneItems()
 
 	colWidth := m.width / 2
 	panelHeight := m.height - 1 // 1 line for help bar
@@ -249,23 +324,50 @@ func (m model) View() string {
 		taskContent.WriteString("\n  " + m.input.View() + "\n")
 	}
 
-	// Build done column content
+	// Build done column content with unified item list
 	var doneContent strings.Builder
-	if len(done) == 0 {
-		doneContent.WriteString("  No completed tasks.\n")
+	completedCount := len(m.completedTasks())
+	inCommits := false
+
+	if len(items) == 0 {
+		doneContent.WriteString("  Nothing here yet.\n")
 	}
-	for i, task := range done {
+
+	for i, item := range items {
+		// Insert divider when transitioning from tasks to commits
+		if item.isCommit && !inCommits {
+			if completedCount > 0 {
+				doneContent.WriteString(dividerStyle.Render("  ── commits ──") + "\n")
+			} else {
+				doneContent.WriteString(dividerStyle.Render("  ── commits ──") + "\n")
+			}
+			inCommits = true
+		}
+
 		cursor := "  "
 		if m.pane == 1 && i == m.doneCursor {
 			cursor = "> "
 		}
-		line := fmt.Sprintf("%s%s", cursor, task.Title)
-		if m.pane == 1 && i == m.doneCursor {
-			line = selectedStyle.Render(line)
+
+		if item.isCommit {
+			line := fmt.Sprintf("%s%s %s", cursor, item.commit.Hash, item.commit.Subject)
+			if item.commit.Hidden {
+				line = hiddenStyle.Render(line)
+			} else if m.pane == 1 && i == m.doneCursor {
+				line = selectedStyle.Render(line)
+			} else {
+				line = commitStyle.Render(line)
+			}
+			doneContent.WriteString(line + "\n")
 		} else {
-			line = doneStyle.Render(line)
+			line := fmt.Sprintf("%s%s", cursor, item.task.Title)
+			if m.pane == 1 && i == m.doneCursor {
+				line = selectedStyle.Render(line)
+			} else {
+				line = doneStyle.Render(line)
+			}
+			doneContent.WriteString(line + "\n")
 		}
-		doneContent.WriteString(line + "\n")
 	}
 
 	leftPanel := renderPanel("Task [1]", taskContent.String(), colWidth, panelHeight, m.pane == 0)
@@ -273,7 +375,7 @@ func (m model) View() string {
 
 	columns := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, rightPanel)
 
-	help := helpStyle.Render(" a: add • space/enter: toggle • d: delete • j/k: navigate • 1/2: switch pane • q: quit")
+	help := helpStyle.Render(" a: add • space/enter: toggle • d: delete/hide • r: refresh • u: show hidden • j/k: nav • 1/2: pane • q: quit")
 
 	if m.err != nil {
 		help += "  " + lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Render(fmt.Sprintf("Error: %v", m.err))
