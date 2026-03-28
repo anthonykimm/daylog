@@ -164,13 +164,8 @@ func (m model) View() string {
 	} else {
 		availableHeight = m.height - 1 - bannerHeight
 	}
-	var topHeight, bottomHeight int
-	if hasLinear {
-		bottomHeight = availableHeight / 3
-		topHeight = availableHeight - bottomHeight
-	} else {
-		topHeight = availableHeight
-	}
+	bottomHeight := availableHeight / 3
+	topHeight := availableHeight - bottomHeight
 
 	// Build task column content
 	var taskContent strings.Builder
@@ -245,8 +240,22 @@ func (m model) View() string {
 
 	columns := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, rightPanel)
 
-	// Linear panel (bottom 1/3)
+	// Build Summary panel content
+	summaryPane := m.summaryPaneIndex()
+	summaryHeader := time.Now().Format("Jan 2") + " Update:"
+	var summaryContent strings.Builder
+	summaryItems := m.summaryItems()
+	summaryContent.WriteString("  " + lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15")).Render(summaryHeader) + "\n\n")
+	if len(summaryItems) == 0 {
+		summaryContent.WriteString("  No completed items yet.\n")
+	}
+	for _, item := range summaryItems {
+		summaryContent.WriteString("  " + helpStyle.Render("- ") + item + "\n")
+	}
+
+	// Bottom row
 	if hasLinear {
+		// Linear panel (bottom left)
 		var linearContent strings.Builder
 		if len(m.linearIssues) == 0 {
 			linearContent.WriteString("  No assigned issues.\n")
@@ -269,7 +278,7 @@ func (m model) View() string {
 			right := fmt.Sprintf("%s %s", priorityIcon(issue.Priority), statusIcon(issue.StatusType))
 
 			// Pad to fill width, right-align the icons
-			innerW := m.width - 4 // border + minimal padding
+			innerW := colWidth - 4
 			leftW := lipgloss.Width(left)
 			rightW := lipgloss.Width(right)
 			gap := innerW - leftW - rightW
@@ -286,8 +295,16 @@ func (m model) View() string {
 			linearContent.WriteString(line + "\n")
 		}
 
-		linearPanel := renderPanel("Linear [3]", linearContent.String(), m.width, bottomHeight, m.pane == 2)
-		columns = columns + "\n" + linearPanel
+		summaryTitle := fmt.Sprintf("Summary [%d]", summaryPane+1)
+		linearPanel := renderPanel("Linear [3]", linearContent.String(), colWidth, bottomHeight, m.pane == 2)
+		summaryPanel := renderPanel(summaryTitle, summaryContent.String(), m.width-colWidth, bottomHeight, m.pane == summaryPane)
+		bottomRow := lipgloss.JoinHorizontal(lipgloss.Top, linearPanel, summaryPanel)
+		columns = columns + "\n" + bottomRow
+	} else {
+		// Summary only (full width)
+		summaryTitle := fmt.Sprintf("Summary [%d]", summaryPane+1)
+		summaryPanel := renderPanel(summaryTitle, summaryContent.String(), m.width, bottomHeight, m.pane == summaryPane)
+		columns = columns + "\n" + summaryPanel
 	}
 
 	// Overlay for Linear auth modes
@@ -368,11 +385,11 @@ func (m model) View() string {
 
 	// Build help bar
 	var helpParts []string
-	helpParts = append(helpParts, "a: add", "space/enter: toggle", "d: delete/hide", "r: refresh", "u: show hidden", "j/k: nav")
+	helpParts = append(helpParts, "a: add", "space/enter: toggle", "d: delete/hide", "r: refresh", "u: show hidden", "c: copy", "j/k: nav")
 	if hasLinear {
-		helpParts = append(helpParts, "o: open", "1/2/3: pane", "L: Linear")
+		helpParts = append(helpParts, "o: open", "1/2/3/4: pane", "L: Linear")
 	} else {
-		helpParts = append(helpParts, "1/2: pane", "L: link Linear")
+		helpParts = append(helpParts, "1/2/3: pane", "L: link Linear")
 	}
 	helpParts = append(helpParts, "q: quit")
 	help := helpStyle.Render(" " + strings.Join(helpParts, " • "))

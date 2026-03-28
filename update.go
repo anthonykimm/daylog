@@ -40,6 +40,13 @@ func (m model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "3":
 		if linearIsAuthenticated(m.db) {
 			m.pane = 2
+		} else {
+			m.pane = m.summaryPaneIndex()
+		}
+
+	case "4":
+		if linearIsAuthenticated(m.db) {
+			m.pane = m.summaryPaneIndex()
 		}
 
 	case "up", "k":
@@ -201,6 +208,12 @@ func (m model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.pane == 2 && len(m.linearIssues) > 0 {
 			issue := m.linearIssues[m.linearCursor]
 			openBrowser(issue.URL)
+		}
+
+	case "c":
+		if m.pane == m.summaryPaneIndex() {
+			text := m.summaryText()
+			copyToClipboard(text)
 		}
 	}
 

@@ -2,10 +2,15 @@ package main
 
 import (
 	"database/sql"
+	"regexp"
+	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 )
+
+var conventionalPrefix = regexp.MustCompile(`^(?:feat|fix|chore|docs|refactor|test|ci|build|perf|style)(?:\(.*?\))?:\s*`)
 
 type mode int
 
@@ -128,6 +133,67 @@ func (m *model) clampDoneCursor() {
 	if m.doneCursor < 0 {
 		m.doneCursor = 0
 	}
+}
+
+// summaryPaneIndex returns the pane index for the Summary panel.
+// 3 if Linear is present, 2 if not (but pane 2 is Linear when present).
+func (m model) summaryPaneIndex() int {
+	if linearIsAuthenticated(m.db) {
+		return 3
+	}
+	return 2
+}
+
+// summaryItems builds the cleaned summary lines for display and clipboard.
+func (m model) summaryItems() []string {
+	var items []string
+	linkedIDs := make(map[int]bool)
+
+	// Completed tasks (non-hidden)
+	for _, t := range m.tasks {
+		if !t.Completed || t.Hidden {
+			continue
+		}
+		// Check if linked to Linear
+		_, extKey, _ := getTaskLink(m.db, t.ID, "linear")
+		if extKey != "" {
+			linkedIDs[t.ID] = true
+			// Strip issue ID prefix: "ENG-123 - Subject" -> "Subject"
+			title := t.Title
+			if idx := strings.Index(title, " - "); idx != -1 {
+				title = title[idx+3:]
+			}
+			items = append(items, title)
+		} else {
+			items = append(items, t.Title)
+		}
+	}
+
+	// Git commits (non-hidden)
+	for _, c := range m.commits {
+		if c.Hidden {
+			continue
+		}
+		subject := conventionalPrefix.ReplaceAllString(c.Subject, "")
+		items = append(items, subject)
+	}
+
+	return items
+}
+
+// summaryText builds the full summary string for clipboard.
+func (m model) summaryText() string {
+	header := time.Now().Format("Jan 2") + " Update:"
+	items := m.summaryItems()
+	if len(items) == 0 {
+		return header
+	}
+	var sb strings.Builder
+	sb.WriteString(header)
+	for _, item := range items {
+		sb.WriteString("\n- " + item)
+	}
+	return sb.String()
 }
 
 func (m model) Init() tea.Cmd {
