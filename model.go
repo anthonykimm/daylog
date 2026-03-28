@@ -14,7 +14,7 @@ var (
 	borderColor    = lipgloss.Color("12")
 	dimBorderColor = lipgloss.Color("8")
 	selectedStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("14"))
-	doneStyle      = lipgloss.NewStyle().Strikethrough(true).Foreground(lipgloss.Color("8"))
+	doneStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
 	commitStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
 	hiddenStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Italic(true)
 	dividerStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
@@ -79,7 +79,7 @@ func (m model) pendingTasks() []Task {
 func (m model) completedTasks() []Task {
 	var out []Task
 	for _, t := range m.tasks {
-		if t.Completed {
+		if t.Completed && (!t.Hidden || m.showHidden) {
 			out = append(out, t)
 		}
 	}
@@ -215,13 +215,22 @@ func (m model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m.clampDoneCursor()
 				}
 			} else {
-				// Toggle completed task back to pending
 				idx := m.findTaskIndex(item.task.ID)
-				if err := toggleTask(m.db, item.task.ID); err != nil {
-					m.err = err
-					return m, nil
+				if item.task.Hidden {
+					// Unhide a hidden completed task
+					if err := unhideTask(m.db, item.task.ID); err != nil {
+						m.err = err
+						return m, nil
+					}
+					m.tasks[idx].Hidden = false
+				} else {
+					// Toggle completed task back to pending
+					if err := toggleTask(m.db, item.task.ID); err != nil {
+						m.err = err
+						return m, nil
+					}
+					m.tasks[idx].Completed = false
 				}
-				m.tasks[idx].Completed = false
 				m.clampDoneCursor()
 			}
 		}
@@ -252,11 +261,13 @@ func (m model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 			} else {
 				idx := m.findTaskIndex(item.task.ID)
-				if err := deleteTask(m.db, item.task.ID); err != nil {
-					m.err = err
-					return m, nil
+				if !item.task.Hidden {
+					if err := hideTask(m.db, item.task.ID); err != nil {
+						m.err = err
+						return m, nil
+					}
+					m.tasks[idx].Hidden = true
 				}
-				m.tasks = append(m.tasks[:idx], m.tasks[idx+1:]...)
 				m.clampDoneCursor()
 			}
 		}
@@ -361,7 +372,9 @@ func (m model) View() string {
 			doneContent.WriteString(line + "\n")
 		} else {
 			line := fmt.Sprintf("%s%s", cursor, item.task.Title)
-			if m.pane == 1 && i == m.doneCursor {
+			if item.task.Hidden {
+				line = hiddenStyle.Render(line)
+			} else if m.pane == 1 && i == m.doneCursor {
 				line = selectedStyle.Render(line)
 			} else {
 				line = doneStyle.Render(line)

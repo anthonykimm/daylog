@@ -11,12 +11,13 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const currentSchemaVersion = 2
+const currentSchemaVersion = 3
 
 type Task struct {
 	ID        int
 	Title     string
 	Completed bool
+	Hidden    bool
 	CreatedAt time.Time
 }
 
@@ -76,6 +77,17 @@ func migrate(db *sql.DB) error {
 		version = 2
 	}
 
+	if version < 3 {
+		_, err := db.Exec(`
+			ALTER TABLE tasks ADD COLUMN hidden BOOLEAN NOT NULL DEFAULT 0;
+			PRAGMA user_version = 3;
+		`)
+		if err != nil {
+			return err
+		}
+		version = 3
+	}
+
 	if version > currentSchemaVersion {
 		return fmt.Errorf("unknown schema version %d (expected <=%d)", version, currentSchemaVersion)
 	}
@@ -116,12 +128,22 @@ func deleteTask(db *sql.DB, id int) error {
 	return err
 }
 
+func hideTask(db *sql.DB, id int) error {
+	_, err := db.Exec("UPDATE tasks SET hidden = 1 WHERE id = ?", id)
+	return err
+}
+
+func unhideTask(db *sql.DB, id int) error {
+	_, err := db.Exec("UPDATE tasks SET hidden = 0 WHERE id = ?", id)
+	return err
+}
+
 func loadTasksForDate(db *sql.DB, date time.Time) ([]Task, error) {
 	start := time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, date.Location())
 	end := start.Add(24 * time.Hour)
 
 	rows, err := db.Query(
-		"SELECT id, title, completed, created_at FROM tasks WHERE created_at >= ? AND created_at < ? ORDER BY id",
+		"SELECT id, title, completed, hidden, created_at FROM tasks WHERE created_at >= ? AND created_at < ? ORDER BY id",
 		start, end,
 	)
 	if err != nil {
@@ -132,7 +154,7 @@ func loadTasksForDate(db *sql.DB, date time.Time) ([]Task, error) {
 	var tasks []Task
 	for rows.Next() {
 		var t Task
-		if err := rows.Scan(&t.ID, &t.Title, &t.Completed, &t.CreatedAt); err != nil {
+		if err := rows.Scan(&t.ID, &t.Title, &t.Completed, &t.Hidden, &t.CreatedAt); err != nil {
 			return nil, err
 		}
 		tasks = append(tasks, t)
