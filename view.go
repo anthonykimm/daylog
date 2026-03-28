@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/lipgloss"
 )
@@ -94,6 +95,65 @@ func (m model) View() string {
 		}
 	}
 	bannerHeight := len(daylogBannerLines) + 1 // +1 for spacing after
+
+	// Build stats panel (right side of banner)
+	remaining := len(pending)
+	completed := len(m.completedTasks())
+	commitCount := len(m.commits)
+	total := remaining + completed
+	var progressStr string
+	if total > 0 {
+		pct := completed * 100 / total
+		progressStr = fmt.Sprintf("%d/%d (%d%%)", completed, total, pct)
+	} else {
+		progressStr = "0/0"
+	}
+
+	labelStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	valueStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Bold(true)
+	dateStyle := lipgloss.NewStyle().Foreground(borderColor).Bold(true)
+
+	now := time.Now()
+	dateStr := now.Format("Mon, Jan 2")
+
+	pad := "    "
+	var statsBlock strings.Builder
+	statsBlock.WriteString("\n")
+	statsBlock.WriteString(pad + dateStyle.Render(dateStr) + "\n")
+	statsBlock.WriteString("\n")
+	statsBlock.WriteString(pad + labelStyle.Render("Remaining   ") + valueStyle.Render(fmt.Sprintf("%d", remaining)) + "\n")
+	statsBlock.WriteString(pad + labelStyle.Render("Completed   ") + valueStyle.Render(fmt.Sprintf("%d", completed)) + "\n")
+	statsBlock.WriteString(pad + labelStyle.Render("Commits     ") + valueStyle.Render(fmt.Sprintf("%d", commitCount)) + "\n")
+	statsBlock.WriteString(pad + labelStyle.Render("Progress    ") + valueStyle.Render(progressStr) + "\n")
+
+	// Pad stats block to match banner height
+	statsLines := strings.Split(strings.TrimRight(statsBlock.String(), "\n"), "\n")
+	for len(statsLines) < len(daylogBannerLines) {
+		statsLines = append(statsLines, "")
+	}
+	paddedStats := strings.Join(statsLines[:len(daylogBannerLines)], "\n")
+
+	// Join banner and stats horizontally, right-align stats
+	bannerStr := daylogBanner.String()
+	bannerW := 0
+	for _, line := range daylogBannerLines {
+		w := lipgloss.Width("  " + line)
+		if w > bannerW {
+			bannerW = w
+		}
+	}
+	statsW := 0
+	for _, line := range statsLines {
+		w := lipgloss.Width(line)
+		if w > statsW {
+			statsW = w
+		}
+	}
+	gap := m.width - bannerW - statsW - 4 // 4 for right margin
+	if gap < 2 {
+		gap = 2
+	}
+	headerBlock := lipgloss.JoinHorizontal(lipgloss.Top, "  "+paddedStats, strings.Repeat(" ", gap), bannerStr)
 
 	isLinearOverlay := m.mode == modeLinearClientID || m.mode == modeLinearClientSecret || m.mode == modeLinearAuth || m.mode == modeLinearMenu
 
@@ -324,7 +384,7 @@ func (m model) View() string {
 	if isLinearOverlay {
 		return columns + "\n" + help
 	}
-	return daylogBanner.String() + "\n\n" + columns + "\n" + help
+	return headerBlock + "\n\n" + columns + "\n" + help
 }
 
 func renderPanel(title string, content string, width, height int, focused bool) string {
