@@ -11,7 +11,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const currentSchemaVersion = 3
+const currentSchemaVersion = 4
 
 type Task struct {
 	ID        int
@@ -86,6 +86,20 @@ func migrate(db *sql.DB) error {
 			return err
 		}
 		version = 3
+	}
+
+	if version < 4 {
+		_, err := db.Exec(`
+			CREATE TABLE IF NOT EXISTS config (
+				key TEXT PRIMARY KEY,
+				value TEXT NOT NULL
+			);
+			PRAGMA user_version = 4;
+		`)
+		if err != nil {
+			return err
+		}
+		version = 4
 	}
 
 	if version > currentSchemaVersion {
@@ -188,4 +202,26 @@ func loadHiddenCommits(db *sql.DB) (map[string]bool, error) {
 		hidden[hash] = true
 	}
 	return hidden, rows.Err()
+}
+
+func getConfig(db *sql.DB, key string) (string, error) {
+	var value string
+	err := db.QueryRow("SELECT value FROM config WHERE key = ?", key).Scan(&value)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return value, err
+}
+
+func setConfig(db *sql.DB, key, value string) error {
+	_, err := db.Exec(
+		"INSERT INTO config (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = ?",
+		key, value, value,
+	)
+	return err
+}
+
+func deleteConfig(db *sql.DB, key string) error {
+	_, err := db.Exec("DELETE FROM config WHERE key = ?", key)
+	return err
 }

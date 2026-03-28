@@ -26,6 +26,10 @@ type mode int
 const (
 	modeNormal mode = iota
 	modeInput
+	modeLinearClientID
+	modeLinearClientSecret
+	modeLinearAuth
+	modeLinearMenu
 )
 
 // doneItem represents an item in the Done pane's unified list.
@@ -46,6 +50,9 @@ type model struct {
 	doneCursor    int
 	mode          mode
 	input         textinput.Model
+	linearInput   textinput.Model
+	linearStatus  string
+	linearMenuIdx int
 	width         int
 	height        int
 	err           error
@@ -57,12 +64,16 @@ func newModel(db *sql.DB, tasks []Task, commits []Commit, hidden map[string]bool
 	ti.Placeholder = "New task..."
 	ti.CharLimit = 256
 
+	li := textinput.New()
+	li.CharLimit = 256
+
 	return model{
 		db:            db,
 		tasks:         tasks,
 		commits:       commits,
 		hiddenCommits: hidden,
 		input:         ti,
+		linearInput:   li,
 	}
 }
 
@@ -126,17 +137,40 @@ func (m model) Init() tea.Cmd {
 	return nil
 }
 
+// linearAuthResult is sent when the OAuth flow completes.
+type linearAuthResult struct {
+	token string
+	err   error
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
 		return m, nil
-	case tea.KeyMsg:
-		if m.mode == modeInput {
-			return m.handleInputMode(msg)
+	case linearAuthResult:
+		if msg.err != nil {
+			m.err = msg.err
+			m.linearStatus = ""
+		} else {
+			m.linearStatus = "Connected to Linear"
 		}
-		return m.handleNormalMode(msg)
+		m.mode = modeNormal
+		return m, nil
+	case tea.KeyMsg:
+		switch m.mode {
+		case modeInput:
+			return m.handleInputMode(msg)
+		case modeLinearClientID, modeLinearClientSecret:
+			return m.handleLinearCredentialMode(msg)
+		case modeLinearAuth:
+			return m.handleLinearAuthMode(msg)
+		case modeLinearMenu:
+			return m.handleLinearMenuMode(msg)
+		default:
+			return m.handleNormalMode(msg)
+		}
 	}
 
 	return m, nil
@@ -181,6 +215,22 @@ func (m model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "r":
 		m.refreshCommits()
 		m.clampDoneCursor()
+
+	case "L":
+		if linearIsAuthenticated(m.db) {
+			m.mode = modeLinearMenu
+			m.linearMenuIdx = 0
+		} else if linearHasCredentials(m.db) {
+			m.mode = modeLinearAuth
+			m.linearStatus = "Opening browser for Linear authorization..."
+			return m, m.startLinearOAuth()
+		} else {
+			m.mode = modeLinearClientID
+			m.linearInput.Placeholder = "Linear Client ID"
+			m.linearInput.Reset()
+			m.linearInput.Focus()
+			return m, m.linearInput.Cursor.BlinkCmd()
+		}
 
 	case "u":
 		if m.pane == 1 {
@@ -304,6 +354,109 @@ func (m model) handleInputMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+func (m model) startLinearOAuth() tea.Cmd {
+	return func() tea.Msg {
+		token, err := linearStartOAuth(m.db)
+		return linearAuthResult{token: token, err: err}
+	}
+}
+
+func (m model) handleLinearCredentialMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.mode = modeNormal
+		m.linearInput.Blur()
+		return m, nil
+
+	case "enter":
+		value := m.linearInput.Value()
+		if value == "" {
+			return m, nil
+		}
+		if m.mode == modeLinearClientID {
+			// Store client ID temporarily, prompt for secret
+			m.linearStatus = value // stash client ID temporarily
+			m.mode = modeLinearClientSecret
+			m.linearInput.Placeholder = "Linear Client Secret"
+			m.linearInput.Reset()
+			m.linearInput.Focus()
+			m.linearInput.EchoMode = textinput.EchoPassword
+			return m, m.linearInput.Cursor.BlinkCmd()
+		}
+		// modeLinearClientSecret — save both and start OAuth
+		clientID := m.linearStatus
+		clientSecret := value
+		m.linearInput.Blur()
+		m.linearInput.EchoMode = textinput.EchoNormal
+		if err := linearSaveCredentials(m.db, clientID, clientSecret); err != nil {
+			m.err = err
+			m.mode = modeNormal
+			return m, nil
+		}
+		m.mode = modeLinearAuth
+		m.linearStatus = "Opening browser for Linear authorization..."
+		return m, m.startLinearOAuth()
+	}
+
+	var cmd tea.Cmd
+	m.linearInput, cmd = m.linearInput.Update(msg)
+	return m, cmd
+}
+
+func (m model) handleLinearAuthMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// While waiting for OAuth, only allow cancel
+	if msg.String() == "esc" {
+		m.mode = modeNormal
+		m.linearStatus = ""
+	}
+	return m, nil
+}
+
+var linearMenuItems = []string{"Re-authorize", "Reset credentials", "Disconnect"}
+
+func (m model) handleLinearMenuMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.mode = modeNormal
+		return m, nil
+
+	case "up", "k":
+		if m.linearMenuIdx > 0 {
+			m.linearMenuIdx--
+		}
+
+	case "down", "j":
+		if m.linearMenuIdx < len(linearMenuItems)-1 {
+			m.linearMenuIdx++
+		}
+
+	case "enter":
+		switch m.linearMenuIdx {
+		case 0: // Re-authorize
+			m.mode = modeLinearAuth
+			m.linearStatus = "Opening browser for Linear authorization..."
+			return m, m.startLinearOAuth()
+		case 1: // Reset credentials
+			if err := linearClearAll(m.db); err != nil {
+				m.err = err
+			}
+			m.linearStatus = ""
+			m.mode = modeLinearClientID
+			m.linearInput.Placeholder = "Linear Client ID"
+			m.linearInput.Reset()
+			m.linearInput.Focus()
+			return m, m.linearInput.Cursor.BlinkCmd()
+		case 2: // Disconnect
+			if err := linearClearAll(m.db); err != nil {
+				m.err = err
+			}
+			m.linearStatus = ""
+			m.mode = modeNormal
+		}
+	}
+	return m, nil
+}
+
 func (m model) View() string {
 	if m.quitting {
 		return ""
@@ -388,7 +541,92 @@ func (m model) View() string {
 
 	columns := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, rightPanel)
 
-	help := helpStyle.Render(" a: add • space/enter: toggle • d: delete/hide • r: refresh • u: show hidden • j/k: nav • 1/2: pane • q: quit")
+	// Overlay for Linear auth modes
+	bannerLines := []string{
+		"░███████                         ░██                                        ░██                                          ",
+		"░██   ░██                        ░██                            ░██ ░██     ░██                                          ",
+		"░██    ░██  ░██████   ░██    ░██ ░██  ░███████   ░████████     ░██   ░██    ░██         ░██░████████   ░███████   ░██████   ░██░████ ",
+		"░██    ░██       ░██  ░██    ░██ ░██ ░██    ░██ ░██    ░██    ░██     ░██   ░██         ░██░██    ░██ ░██    ░██       ░██  ░███     ",
+		"░██    ░██  ░███████  ░██    ░██ ░██ ░██    ░██ ░██    ░██     ░██   ░██    ░██         ░██░██    ░██ ░█████████  ░███████  ░██      ",
+		"░██   ░██  ░██   ░██  ░██   ░███ ░██ ░██    ░██ ░██   ░███      ░██ ░██     ░██         ░██░██    ░██ ░██        ░██   ░██  ░██      ",
+		"░███████    ░█████░██  ░█████░██ ░██  ░███████   ░█████░██                  ░██████████ ░██░██    ░██  ░███████   ░█████░██ ░██      ",
+		"                             ░██                       ░██                                                                           ",
+		"                       ░███████                  ░███████                                                                            ",
+	}
+	// Pad all banner lines to the same width so they center as a block
+	maxBannerWidth := 0
+	for _, line := range bannerLines {
+		w := lipgloss.Width(line)
+		if w > maxBannerWidth {
+			maxBannerWidth = w
+		}
+	}
+	for i, line := range bannerLines {
+		w := lipgloss.Width(line)
+		if w < maxBannerWidth {
+			bannerLines[i] = line + strings.Repeat(" ", maxBannerWidth-w)
+		}
+	}
+
+	// Blue to light blue gradient: dark blue -> medium blue -> light blue
+	gradientColors := []string{"21", "27", "33", "39", "45", "51", "87", "123", "159"}
+	var linearBannerBuilder strings.Builder
+	for i, line := range bannerLines {
+		colorIdx := i
+		if colorIdx >= len(gradientColors) {
+			colorIdx = len(gradientColors) - 1
+		}
+		style := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(gradientColors[colorIdx]))
+		linearBannerBuilder.WriteString(style.Render(line))
+		if i < len(bannerLines)-1 {
+			linearBannerBuilder.WriteString("\n")
+		}
+	}
+	linearBanner := linearBannerBuilder.String()
+
+	switch m.mode {
+	case modeLinearClientID:
+		body := fmt.Sprintf("Enter Linear Client ID:\n\n%s\n\n%s",
+			m.linearInput.View(),
+			helpStyle.Render("enter: confirm • esc: cancel"))
+		columns = renderPanelWithBanner("Linear", linearBanner, body, m.width, panelHeight)
+	case modeLinearClientSecret:
+		body := fmt.Sprintf("Enter Linear Client Secret:\n\n%s\n\n%s",
+			m.linearInput.View(),
+			helpStyle.Render("enter: confirm • esc: cancel"))
+		columns = renderPanelWithBanner("Linear", linearBanner, body, m.width, panelHeight)
+	case modeLinearAuth:
+		body := fmt.Sprintf("%s\n\n%s",
+			m.linearStatus,
+			helpStyle.Render("Waiting for browser... esc: cancel"))
+		columns = renderPanelWithBanner("Linear", linearBanner, body, m.width, panelHeight)
+	case modeLinearMenu:
+		var menuBody strings.Builder
+		for i, item := range linearMenuItems {
+			cursor := "  "
+			if i == m.linearMenuIdx {
+				cursor = "> "
+			}
+			line := fmt.Sprintf("%s%s", cursor, item)
+			if i == m.linearMenuIdx {
+				line = selectedStyle.Render(line)
+			}
+			menuBody.WriteString(line + "\n")
+		}
+		menuBody.WriteString("\n" + helpStyle.Render("enter: select • esc: cancel"))
+		columns = renderPanelWithBanner("Linear", linearBanner, menuBody.String(), m.width, panelHeight)
+	}
+
+	// Build help bar
+	var helpParts []string
+	helpParts = append(helpParts, "a: add", "space/enter: toggle", "d: delete/hide", "r: refresh", "u: show hidden", "j/k: nav", "1/2: pane")
+	if !linearIsAuthenticated(m.db) {
+		helpParts = append(helpParts, "L: link Linear")
+	} else {
+		helpParts = append(helpParts, "L: Linear")
+	}
+	helpParts = append(helpParts, "q: quit")
+	help := helpStyle.Render(" " + strings.Join(helpParts, " • "))
 
 	if m.err != nil {
 		help += "  " + lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Render(fmt.Sprintf("Error: %v", m.err))
@@ -443,6 +681,149 @@ func renderPanel(title string, content string, width, height int, focused bool) 
 			pad = 0
 		}
 		sb.WriteString(bStyle.Render("│") + line + strings.Repeat(" ", pad) + bStyle.Render("│") + "\n")
+	}
+	sb.WriteString(bottom)
+
+	return sb.String()
+}
+
+func renderPanelCentered(title string, content string, width, height int, focused bool) string {
+	bc := dimBorderColor
+	if focused {
+		bc = borderColor
+	}
+
+	bStyle := lipgloss.NewStyle().Foreground(bc)
+	tStyle := lipgloss.NewStyle().Foreground(bc).Bold(true)
+
+	innerW := width - 2
+	innerH := height - 2
+	if innerW < 0 {
+		innerW = 0
+	}
+	if innerH < 0 {
+		innerH = 0
+	}
+
+	// Top border: ╭─ Title ──...──╮
+	titleText := fmt.Sprintf(" %s ", title)
+	titleLen := len([]rune(titleText))
+	dashesAfter := innerW - 1 - titleLen
+	if dashesAfter < 0 {
+		dashesAfter = 0
+	}
+	top := bStyle.Render("╭─") + tStyle.Render(titleText) + bStyle.Render(strings.Repeat("─", dashesAfter)+"╮")
+
+	// Bottom border: ╰──...──╯
+	bottom := bStyle.Render("╰" + strings.Repeat("─", innerW) + "╯")
+
+	// Split content into lines
+	contentLines := strings.Split(strings.TrimRight(content, "\n"), "\n")
+
+	// Vertical centering
+	topPad := (innerH - len(contentLines)) / 2
+	if topPad < 0 {
+		topPad = 0
+	}
+
+	var lines []string
+	for i := 0; i < topPad; i++ {
+		lines = append(lines, "")
+	}
+	lines = append(lines, contentLines...)
+	for len(lines) < innerH {
+		lines = append(lines, "")
+	}
+	lines = lines[:innerH]
+
+	var sb strings.Builder
+	sb.WriteString(top + "\n")
+	for _, line := range lines {
+		lineW := lipgloss.Width(line)
+		// Horizontal centering
+		leftPad := (innerW - lineW) / 2
+		rightPad := innerW - lineW - leftPad
+		if leftPad < 0 {
+			leftPad = 0
+		}
+		if rightPad < 0 {
+			rightPad = 0
+		}
+		sb.WriteString(bStyle.Render("│") + strings.Repeat(" ", leftPad) + line + strings.Repeat(" ", rightPad) + bStyle.Render("│") + "\n")
+	}
+	sb.WriteString(bottom)
+
+	return sb.String()
+}
+
+// renderPanelWithBanner renders a full-screen panel with a banner at the top
+// and body content vertically centered in the remaining space.
+func renderPanelWithBanner(title string, banner string, body string, width, height int) string {
+	bc := borderColor
+	bStyle := lipgloss.NewStyle().Foreground(bc)
+	tStyle := lipgloss.NewStyle().Foreground(bc).Bold(true)
+
+	innerW := width - 2
+	innerH := height - 2
+	if innerW < 0 {
+		innerW = 0
+	}
+	if innerH < 0 {
+		innerH = 0
+	}
+
+	// Top border
+	titleText := fmt.Sprintf(" %s ", title)
+	titleLen := len([]rune(titleText))
+	dashesAfter := innerW - 1 - titleLen
+	if dashesAfter < 0 {
+		dashesAfter = 0
+	}
+	top := bStyle.Render("╭─") + tStyle.Render(titleText) + bStyle.Render(strings.Repeat("─", dashesAfter)+"╮")
+	bottom := bStyle.Render("╰" + strings.Repeat("─", innerW) + "╯")
+
+	// Banner lines (top-aligned, centered horizontally)
+	bannerLines := strings.Split(strings.TrimRight(banner, "\n"), "\n")
+	// Body lines (centered in the full panel height, independent of banner)
+	bodyLines := strings.Split(strings.TrimRight(body, "\n"), "\n")
+	bodyTopPad := (innerH - len(bodyLines)) / 2
+	if bodyTopPad < 0 {
+		bodyTopPad = 0
+	}
+
+	// Start with empty panel
+	allLines := make([]string, innerH)
+
+	// Place banner at top with padding
+	bannerStart := 10
+	for i, line := range bannerLines {
+		idx := bannerStart + i
+		if idx < innerH {
+			allLines[idx] = line
+		}
+	}
+
+	// Place body centered vertically
+	for i, line := range bodyLines {
+		idx := bodyTopPad + i
+		if idx < innerH {
+			allLines[idx] = line
+		}
+	}
+
+	var sb strings.Builder
+	sb.WriteString(top + "\n")
+	for _, line := range allLines {
+		lineW := lipgloss.Width(line)
+		leftPad := (innerW - lineW) / 2
+		rightPad := innerW - lineW - leftPad
+		if leftPad < 0 {
+			leftPad = 0
+		}
+		if rightPad < 0 {
+			rightPad = 0
+		}
+		sb.WriteString(bStyle.Render("│") + strings.Repeat(" ", leftPad) + line + strings.Repeat(" ", rightPad) + bStyle.Render("│") + "\n")
 	}
 	sb.WriteString(bottom)
 
