@@ -601,8 +601,42 @@ func (m model) View() string {
 	items := m.doneItems()
 	hasLinear := linearIsAuthenticated(m.db)
 
+	// Render daylog banner at the top
+	daylogBannerLines := []string{
+		"░███████                         ░██",
+		"░██   ░██                        ░██",
+		"░██    ░██  ░██████   ░██    ░██ ░██  ░███████   ░████████",
+		"░██    ░██       ░██  ░██    ░██ ░██ ░██    ░██ ░██    ░██",
+		"░██    ░██  ░███████  ░██    ░██ ░██ ░██    ░██ ░██    ░██",
+		"░██   ░██  ░██   ░██  ░██   ░███ ░██ ░██    ░██ ░██   ░███",
+		"░███████    ░█████░██  ░█████░██ ░██  ░███████   ░█████░██",
+		"                             ░██                       ░██",
+		"                       ░███████                  ░███████",
+	}
+	daylogGradient := []string{"21", "27", "33", "39", "45", "51", "87", "123", "159"}
+	var daylogBanner strings.Builder
+	for i, line := range daylogBannerLines {
+		colorIdx := i
+		if colorIdx >= len(daylogGradient) {
+			colorIdx = len(daylogGradient) - 1
+		}
+		style := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(daylogGradient[colorIdx]))
+		daylogBanner.WriteString("  " + style.Render(line))
+		if i < len(daylogBannerLines)-1 {
+			daylogBanner.WriteString("\n")
+		}
+	}
+	bannerHeight := len(daylogBannerLines) + 1 // +1 for spacing after
+
+	isLinearOverlay := m.mode == modeLinearClientID || m.mode == modeLinearClientSecret || m.mode == modeLinearAuth || m.mode == modeLinearMenu
+
 	colWidth := m.width / 2
-	availableHeight := m.height - 1 // 1 line for help bar
+	var availableHeight int
+	if isLinearOverlay {
+		availableHeight = m.height - 1
+	} else {
+		availableHeight = m.height - 1 - bannerHeight
+	}
 	var topHeight, bottomHeight int
 	if hasLinear {
 		bottomHeight = availableHeight / 3
@@ -820,7 +854,10 @@ func (m model) View() string {
 		help += "  " + lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Render(fmt.Sprintf("Error: %v", m.err))
 	}
 
-	return columns + "\n" + help
+	if isLinearOverlay {
+		return columns + "\n" + help
+	}
+	return daylogBanner.String() + "\n\n" + columns + "\n" + help
 }
 
 func renderPanel(title string, content string, width, height int, focused bool) string {
