@@ -30,7 +30,12 @@ func main() {
 
 	commits := loadCommits(hidden, false)
 
-	p := tea.NewProgram(newModel(db, tasks, commits, hidden), tea.WithAltScreen())
+	var issues []LinearIssue
+	if linearIsAuthenticated(db) {
+		issues, _ = linearFetchIssues(linearGetToken(db))
+	}
+
+	p := tea.NewProgram(newModel(db, tasks, commits, hidden, issues), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)

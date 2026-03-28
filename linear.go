@@ -13,6 +13,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"github.com/machinebox/graphql"
 )
 
 const (
@@ -191,6 +193,161 @@ func randomState() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(b), nil
+}
+
+// LinearIssue represents a Linear issue for display.
+type LinearIssue struct {
+	ID           string
+	Key          string // e.g., "ENG-123"
+	Title        string
+	Priority     int    // 0=none, 1=urgent, 2=high, 3=medium, 4=low
+	StatusName   string
+	StatusType   string // backlog, unstarted, started, completed, cancelled
+	URL          string
+}
+
+func linearFetchIssues(token string) ([]LinearIssue, error) {
+	client := graphql.NewClient("https://api.linear.app/graphql")
+
+	req := graphql.NewRequest(`
+		query {
+			viewer {
+				assignedIssues(
+					filter: {
+						state: {
+							type: { nin: ["completed", "cancelled"] }
+						}
+					}
+					first: 100
+					orderBy: updatedAt
+				) {
+					nodes {
+						id
+						identifier
+						title
+						priority
+						url
+						state {
+							name
+							type
+						}
+					}
+				}
+			}
+		}
+	`)
+	req.Header.Set("Authorization", token)
+
+	var resp struct {
+		Viewer struct {
+			AssignedIssues struct {
+				Nodes []struct {
+					ID         string `json:"id"`
+					Identifier string `json:"identifier"`
+					Title      string `json:"title"`
+					Priority   int    `json:"priority"`
+					URL        string `json:"url"`
+					State      struct {
+						Name string `json:"name"`
+						Type string `json:"type"`
+					} `json:"state"`
+				} `json:"nodes"`
+			} `json:"assignedIssues"`
+		} `json:"viewer"`
+	}
+
+	if err := client.Run(context.Background(), req, &resp); err != nil {
+		return nil, fmt.Errorf("fetching Linear issues: %w", err)
+	}
+
+	var issues []LinearIssue
+	for _, node := range resp.Viewer.AssignedIssues.Nodes {
+		issues = append(issues, LinearIssue{
+			ID:         node.ID,
+			Key:        node.Identifier,
+			Title:      node.Title,
+			Priority:   node.Priority,
+			StatusName: node.State.Name,
+			StatusType: node.State.Type,
+			URL:        node.URL,
+		})
+	}
+
+	return issues, nil
+}
+
+func linearMarkDone(token string, issueID string) error {
+	client := graphql.NewClient("https://api.linear.app/graphql")
+
+	// First, find the "Done" state for this issue's team
+	stateReq := graphql.NewRequest(`
+		query($id: String!) {
+			issue(id: $id) {
+				team {
+					states(filter: { type: { eq: "completed" } }) {
+						nodes {
+							id
+							name
+						}
+					}
+				}
+			}
+		}
+	`)
+	stateReq.Header.Set("Authorization", token)
+	stateReq.Var("id", issueID)
+
+	var stateResp struct {
+		Issue struct {
+			Team struct {
+				States struct {
+					Nodes []struct {
+						ID   string `json:"id"`
+						Name string `json:"name"`
+					} `json:"nodes"`
+				} `json:"states"`
+			} `json:"team"`
+		} `json:"issue"`
+	}
+
+	if err := client.Run(context.Background(), stateReq, &stateResp); err != nil {
+		return fmt.Errorf("fetching workflow states: %w", err)
+	}
+
+	states := stateResp.Issue.Team.States.Nodes
+	if len(states) == 0 {
+		return fmt.Errorf("no completed state found for this team")
+	}
+
+	// Use the first completed state (typically "Done")
+	doneStateID := states[0].ID
+
+	updateReq := graphql.NewRequest(`
+		mutation($id: String!, $stateId: String!) {
+			issueUpdate(id: $id, input: { stateId: $stateId }) {
+				success
+			}
+		}
+	`)
+	updateReq.Header.Set("Authorization", token)
+	updateReq.Var("id", issueID)
+	updateReq.Var("stateId", doneStateID)
+
+	var updateResp struct {
+		IssueUpdate struct {
+			Success bool `json:"success"`
+		} `json:"issueUpdate"`
+	}
+
+	if err := client.Run(context.Background(), updateReq, &updateResp); err != nil {
+		return fmt.Errorf("updating issue: %w", err)
+	}
+
+	if !updateResp.IssueUpdate.Success {
+		return fmt.Errorf("failed to update issue status")
+	}
+
+	return nil
 }
 
 func openBrowser(url string) error {

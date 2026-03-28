@@ -11,7 +11,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const currentSchemaVersion = 4
+const currentSchemaVersion = 5
 
 type Task struct {
 	ID        int
@@ -100,6 +100,23 @@ func migrate(db *sql.DB) error {
 			return err
 		}
 		version = 4
+	}
+
+	if version < 5 {
+		_, err := db.Exec(`
+			CREATE TABLE IF NOT EXISTS task_links (
+				task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+				source TEXT NOT NULL,
+				external_id TEXT NOT NULL,
+				external_key TEXT,
+				PRIMARY KEY (task_id, source)
+			);
+			PRAGMA user_version = 5;
+		`)
+		if err != nil {
+			return err
+		}
+		version = 5
 	}
 
 	if version > currentSchemaVersion {
@@ -224,4 +241,55 @@ func setConfig(db *sql.DB, key, value string) error {
 func deleteConfig(db *sql.DB, key string) error {
 	_, err := db.Exec("DELETE FROM config WHERE key = ?", key)
 	return err
+}
+
+func addTaskWithLink(db *sql.DB, title, source, externalID, externalKey string) (Task, error) {
+	now := time.Now()
+	result, err := db.Exec(
+		"INSERT INTO tasks (title, completed, created_at) VALUES (?, 0, ?)",
+		title, now,
+	)
+	if err != nil {
+		return Task{}, err
+	}
+
+	id, err := result.LastInsertId()
+	if err != nil {
+		return Task{}, err
+	}
+
+	_, err = db.Exec(
+		"INSERT INTO task_links (task_id, source, external_id, external_key) VALUES (?, ?, ?, ?)",
+		id, source, externalID, externalKey,
+	)
+	if err != nil {
+		return Task{}, err
+	}
+
+	return Task{
+		ID:        int(id),
+		Title:     title,
+		Completed: false,
+		CreatedAt: now,
+	}, nil
+}
+
+func getTaskLink(db *sql.DB, taskID int, source string) (externalID, externalKey string, err error) {
+	err = db.QueryRow(
+		"SELECT external_id, external_key FROM task_links WHERE task_id = ? AND source = ?",
+		taskID, source,
+	).Scan(&externalID, &externalKey)
+	if err == sql.ErrNoRows {
+		return "", "", nil
+	}
+	return
+}
+
+func isLinearIssueLinked(db *sql.DB, externalID string) bool {
+	var count int
+	err := db.QueryRow(
+		"SELECT COUNT(*) FROM task_links WHERE source = 'linear' AND external_id = ?",
+		externalID,
+	).Scan(&count)
+	return err == nil && count > 0
 }

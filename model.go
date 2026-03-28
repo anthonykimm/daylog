@@ -19,7 +19,45 @@ var (
 	hiddenStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Italic(true)
 	dividerStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 	helpStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+
+	priorityUrgent = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("9"))  // red
+	priorityHigh   = lipgloss.NewStyle().Foreground(lipgloss.Color("208"))            // orange
+	priorityMedium = lipgloss.NewStyle().Foreground(lipgloss.Color("11"))             // yellow
+	priorityLow    = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))             // green
+
+	statusBacklog  = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))  // dim
+	statusTodo     = lipgloss.NewStyle().Foreground(lipgloss.Color("15")) // white
+	statusStarted  = lipgloss.NewStyle().Foreground(lipgloss.Color("11")) // yellow
+	statusReview   = lipgloss.NewStyle().Foreground(lipgloss.Color("12")) // blue
 )
+
+func priorityIcon(priority int) string {
+	switch priority {
+	case 1:
+		return priorityUrgent.Render("!!!")
+	case 2:
+		return priorityHigh.Render("!!")
+	case 3:
+		return priorityMedium.Render("!")
+	case 4:
+		return priorityLow.Render("·")
+	default:
+		return " "
+	}
+}
+
+func statusIcon(statusType string) string {
+	switch statusType {
+	case "backlog":
+		return statusBacklog.Render("●")
+	case "unstarted":
+		return statusTodo.Render("●")
+	case "started":
+		return statusStarted.Render("●")
+	default:
+		return statusReview.Render("●")
+	}
+}
 
 type mode int
 
@@ -43,11 +81,13 @@ type model struct {
 	db            *sql.DB
 	tasks         []Task
 	commits       []Commit
+	linearIssues  []LinearIssue
 	hiddenCommits map[string]bool
 	showHidden    bool
-	pane          int // 0 = task, 1 = done
+	pane          int // 0 = task, 1 = done, 2 = linear
 	taskCursor    int
 	doneCursor    int
+	linearCursor  int
 	mode          mode
 	input         textinput.Model
 	linearInput   textinput.Model
@@ -59,7 +99,7 @@ type model struct {
 	quitting      bool
 }
 
-func newModel(db *sql.DB, tasks []Task, commits []Commit, hidden map[string]bool) model {
+func newModel(db *sql.DB, tasks []Task, commits []Commit, hidden map[string]bool, issues []LinearIssue) model {
 	ti := textinput.New()
 	ti.Placeholder = "New task..."
 	ti.CharLimit = 256
@@ -71,6 +111,7 @@ func newModel(db *sql.DB, tasks []Task, commits []Commit, hidden map[string]bool
 		db:            db,
 		tasks:         tasks,
 		commits:       commits,
+		linearIssues:  issues,
 		hiddenCommits: hidden,
 		input:         ti,
 		linearInput:   li,
@@ -110,6 +151,14 @@ func (m model) doneItems() []doneItem {
 	return items
 }
 
+func (m *model) resetLinearUI() {
+	m.linearStatus = ""
+	m.linearMenuIdx = 0
+	m.linearInput.Reset()
+	m.linearInput.Blur()
+	m.linearInput.EchoMode = textinput.EchoNormal
+}
+
 func (m model) findTaskIndex(id int) int {
 	for i, t := range m.tasks {
 		if t.ID == id {
@@ -143,6 +192,17 @@ type linearAuthResult struct {
 	err   error
 }
 
+// linearIssuesResult is sent when issue fetching completes.
+type linearIssuesResult struct {
+	issues []LinearIssue
+	err    error
+}
+
+// linearMarkDoneResult is sent when marking an issue done completes.
+type linearMarkDoneResult struct {
+	err error
+}
+
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
@@ -157,7 +217,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.linearStatus = "Connected to Linear"
 		}
 		m.mode = modeNormal
+		// Fetch issues after successful auth
+		if msg.err == nil {
+			return m, m.fetchLinearIssues()
+		}
 		return m, nil
+	case linearIssuesResult:
+		if msg.err != nil {
+			m.err = msg.err
+		} else {
+			m.linearIssues = msg.issues
+		}
+		return m, nil
+	case linearMarkDoneResult:
+		if msg.err != nil {
+			m.err = msg.err
+		}
+		// Refresh issues after marking done
+		return m, m.fetchLinearIssues()
 	case tea.KeyMsg:
 		switch m.mode {
 		case modeInput:
@@ -191,11 +268,18 @@ func (m model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "2":
 		m.pane = 1
 
+	case "3":
+		if linearIsAuthenticated(m.db) {
+			m.pane = 2
+		}
+
 	case "up", "k":
 		if m.pane == 0 && m.taskCursor > 0 {
 			m.taskCursor--
 		} else if m.pane == 1 && m.doneCursor > 0 {
 			m.doneCursor--
+		} else if m.pane == 2 && m.linearCursor > 0 {
+			m.linearCursor--
 		}
 
 	case "down", "j":
@@ -203,6 +287,8 @@ func (m model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.taskCursor++
 		} else if m.pane == 1 && m.doneCursor < len(items)-1 {
 			m.doneCursor++
+		} else if m.pane == 2 && m.linearCursor < len(m.linearIssues)-1 {
+			m.linearCursor++
 		}
 
 	case "a":
@@ -215,19 +301,17 @@ func (m model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "r":
 		m.refreshCommits()
 		m.clampDoneCursor()
+		if linearIsAuthenticated(m.db) {
+			return m, m.fetchLinearIssues()
+		}
 
 	case "L":
-		if linearIsAuthenticated(m.db) {
+		m.resetLinearUI()
+		if linearIsAuthenticated(m.db) || linearHasCredentials(m.db) {
 			m.mode = modeLinearMenu
-			m.linearMenuIdx = 0
-		} else if linearHasCredentials(m.db) {
-			m.mode = modeLinearAuth
-			m.linearStatus = "Opening browser for Linear authorization..."
-			return m, m.startLinearOAuth()
 		} else {
 			m.mode = modeLinearClientID
 			m.linearInput.Placeholder = "Linear Client ID"
-			m.linearInput.Reset()
 			m.linearInput.Focus()
 			return m, m.linearInput.Cursor.BlinkCmd()
 		}
@@ -250,6 +334,17 @@ func (m model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.tasks[idx].Completed = true
 			if m.taskCursor >= len(pending)-1 && m.taskCursor > 0 {
 				m.taskCursor--
+			}
+			// If linked to Linear, mark done there too
+			externalID, _, _ := getTaskLink(m.db, task.ID, "linear")
+			if externalID != "" {
+				token := linearGetToken(m.db)
+				if token != "" {
+					return m, func() tea.Msg {
+						err := linearMarkDone(token, externalID)
+						return linearMarkDoneResult{err: err}
+					}
+				}
 			}
 		} else if m.pane == 1 && len(items) > 0 {
 			item := items[m.doneCursor]
@@ -282,6 +377,16 @@ func (m model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 					m.tasks[idx].Completed = false
 				}
 				m.clampDoneCursor()
+			}
+		} else if m.pane == 2 && len(m.linearIssues) > 0 {
+			issue := m.linearIssues[m.linearCursor]
+			if !isLinearIssueLinked(m.db, issue.ID) {
+				task, err := addTaskWithLink(m.db, issue.Key+" - "+issue.Title, "linear", issue.ID, issue.Key)
+				if err != nil {
+					m.err = err
+					return m, nil
+				}
+				m.tasks = append(m.tasks, task)
 			}
 		}
 
@@ -321,6 +426,12 @@ func (m model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.clampDoneCursor()
 			}
 		}
+
+	case "o":
+		if m.pane == 2 && len(m.linearIssues) > 0 {
+			issue := m.linearIssues[m.linearCursor]
+			openBrowser(issue.URL)
+		}
 	}
 
 	return m, nil
@@ -354,6 +465,17 @@ func (m model) handleInputMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+func (m model) fetchLinearIssues() tea.Cmd {
+	return func() tea.Msg {
+		token := linearGetToken(m.db)
+		if token == "" {
+			return linearIssuesResult{}
+		}
+		issues, err := linearFetchIssues(token)
+		return linearIssuesResult{issues: issues, err: err}
+	}
+}
+
 func (m model) startLinearOAuth() tea.Cmd {
 	return func() tea.Msg {
 		token, err := linearStartOAuth(m.db)
@@ -364,8 +486,8 @@ func (m model) startLinearOAuth() tea.Cmd {
 func (m model) handleLinearCredentialMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc":
+		m.resetLinearUI()
 		m.mode = modeNormal
-		m.linearInput.Blur()
 		return m, nil
 
 	case "enter":
@@ -406,17 +528,26 @@ func (m model) handleLinearCredentialMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m model) handleLinearAuthMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// While waiting for OAuth, only allow cancel
 	if msg.String() == "esc" {
+		m.resetLinearUI()
 		m.mode = modeNormal
-		m.linearStatus = ""
 	}
 	return m, nil
 }
 
-var linearMenuItems = []string{"Re-authorize", "Reset credentials", "Disconnect"}
+func (m model) linearMenuItems() []string {
+	if linearIsAuthenticated(m.db) {
+		return []string{"Re-authorize", "Reset credentials", "Disconnect"}
+	}
+	// Has credentials but no token
+	return []string{"Authorize", "Reset credentials"}
+}
 
 func (m model) handleLinearMenuMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	items := m.linearMenuItems()
+
 	switch msg.String() {
 	case "esc":
+		m.resetLinearUI()
 		m.mode = modeNormal
 		return m, nil
 
@@ -426,31 +557,31 @@ func (m model) handleLinearMenuMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case "down", "j":
-		if m.linearMenuIdx < len(linearMenuItems)-1 {
+		if m.linearMenuIdx < len(items)-1 {
 			m.linearMenuIdx++
 		}
 
 	case "enter":
-		switch m.linearMenuIdx {
-		case 0: // Re-authorize
+		selected := items[m.linearMenuIdx]
+		switch selected {
+		case "Authorize", "Re-authorize":
 			m.mode = modeLinearAuth
 			m.linearStatus = "Opening browser for Linear authorization..."
 			return m, m.startLinearOAuth()
-		case 1: // Reset credentials
+		case "Reset credentials":
 			if err := linearClearAll(m.db); err != nil {
 				m.err = err
 			}
-			m.linearStatus = ""
+			m.resetLinearUI()
 			m.mode = modeLinearClientID
 			m.linearInput.Placeholder = "Linear Client ID"
-			m.linearInput.Reset()
 			m.linearInput.Focus()
 			return m, m.linearInput.Cursor.BlinkCmd()
-		case 2: // Disconnect
+		case "Disconnect":
 			if err := linearClearAll(m.db); err != nil {
 				m.err = err
 			}
-			m.linearStatus = ""
+			m.resetLinearUI()
 			m.mode = modeNormal
 		}
 	}
@@ -464,9 +595,17 @@ func (m model) View() string {
 
 	pending := m.pendingTasks()
 	items := m.doneItems()
+	hasLinear := linearIsAuthenticated(m.db)
 
 	colWidth := m.width / 2
-	panelHeight := m.height - 1 // 1 line for help bar
+	availableHeight := m.height - 1 // 1 line for help bar
+	var topHeight, bottomHeight int
+	if hasLinear {
+		bottomHeight = availableHeight / 3
+		topHeight = availableHeight - bottomHeight
+	} else {
+		topHeight = availableHeight
+	}
 
 	// Build task column content
 	var taskContent strings.Builder
@@ -536,10 +675,50 @@ func (m model) View() string {
 		}
 	}
 
-	leftPanel := renderPanel("Task [1]", taskContent.String(), colWidth, panelHeight, m.pane == 0)
-	rightPanel := renderPanel("Done [2]", doneContent.String(), m.width-colWidth, panelHeight, m.pane == 1)
+	leftPanel := renderPanel("Task [1]", taskContent.String(), colWidth, topHeight, m.pane == 0)
+	rightPanel := renderPanel("Done [2]", doneContent.String(), m.width-colWidth, topHeight, m.pane == 1)
 
 	columns := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, rightPanel)
+
+	// Linear panel (bottom 1/3)
+	if hasLinear {
+		var linearContent strings.Builder
+		if len(m.linearIssues) == 0 {
+			linearContent.WriteString("  No assigned issues.\n")
+		}
+		for i, issue := range m.linearIssues {
+			cursor := "  "
+			if m.pane == 2 && i == m.linearCursor {
+				cursor = "> "
+			}
+
+			left := fmt.Sprintf("%s%s - %s", cursor, issue.Key, issue.Title)
+			right := fmt.Sprintf("%s %s", priorityIcon(issue.Priority), statusIcon(issue.StatusType))
+
+			// Pad to fill width, right-align the icons
+			innerW := m.width - 4 // border + minimal padding
+			leftW := lipgloss.Width(left)
+			rightW := lipgloss.Width(right)
+			gap := innerW - leftW - rightW
+			if gap < 1 {
+				gap = 1
+			}
+
+			line := left + strings.Repeat(" ", gap) + right
+
+			linked := isLinearIssueLinked(m.db, issue.ID)
+			if m.pane == 2 && i == m.linearCursor {
+				line = selectedStyle.Render(line)
+			} else if linked {
+				line = doneStyle.Render(line)
+			}
+
+			linearContent.WriteString(line + "\n")
+		}
+
+		linearPanel := renderPanel("Linear [3]", linearContent.String(), m.width, bottomHeight, m.pane == 2)
+		columns = columns + "\n" + linearPanel
+	}
 
 	// Overlay for Linear auth modes
 	bannerLines := []string{
@@ -589,20 +768,20 @@ func (m model) View() string {
 		body := fmt.Sprintf("Enter Linear Client ID:\n\n%s\n\n%s",
 			m.linearInput.View(),
 			helpStyle.Render("enter: confirm • esc: cancel"))
-		columns = renderPanelWithBanner("Linear", linearBanner, body, m.width, panelHeight)
+		columns = renderPanelWithBanner("Linear", linearBanner, body, m.width, availableHeight)
 	case modeLinearClientSecret:
 		body := fmt.Sprintf("Enter Linear Client Secret:\n\n%s\n\n%s",
 			m.linearInput.View(),
 			helpStyle.Render("enter: confirm • esc: cancel"))
-		columns = renderPanelWithBanner("Linear", linearBanner, body, m.width, panelHeight)
+		columns = renderPanelWithBanner("Linear", linearBanner, body, m.width, availableHeight)
 	case modeLinearAuth:
 		body := fmt.Sprintf("%s\n\n%s",
 			m.linearStatus,
 			helpStyle.Render("Waiting for browser... esc: cancel"))
-		columns = renderPanelWithBanner("Linear", linearBanner, body, m.width, panelHeight)
+		columns = renderPanelWithBanner("Linear", linearBanner, body, m.width, availableHeight)
 	case modeLinearMenu:
 		var menuBody strings.Builder
-		for i, item := range linearMenuItems {
+		for i, item := range m.linearMenuItems() {
 			cursor := "  "
 			if i == m.linearMenuIdx {
 				cursor = "> "
@@ -614,16 +793,16 @@ func (m model) View() string {
 			menuBody.WriteString(line + "\n")
 		}
 		menuBody.WriteString("\n" + helpStyle.Render("enter: select • esc: cancel"))
-		columns = renderPanelWithBanner("Linear", linearBanner, menuBody.String(), m.width, panelHeight)
+		columns = renderPanelWithBanner("Linear", linearBanner, menuBody.String(), m.width, availableHeight)
 	}
 
 	// Build help bar
 	var helpParts []string
-	helpParts = append(helpParts, "a: add", "space/enter: toggle", "d: delete/hide", "r: refresh", "u: show hidden", "j/k: nav", "1/2: pane")
-	if !linearIsAuthenticated(m.db) {
-		helpParts = append(helpParts, "L: link Linear")
+	helpParts = append(helpParts, "a: add", "space/enter: toggle", "d: delete/hide", "r: refresh", "u: show hidden", "j/k: nav")
+	if hasLinear {
+		helpParts = append(helpParts, "o: open", "1/2/3: pane", "L: Linear")
 	} else {
-		helpParts = append(helpParts, "L: Linear")
+		helpParts = append(helpParts, "1/2: pane", "L: link Linear")
 	}
 	helpParts = append(helpParts, "q: quit")
 	help := helpStyle.Render(" " + strings.Join(helpParts, " • "))
