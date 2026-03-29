@@ -76,3 +76,55 @@ func loadCommits(hidden map[string]bool, showHidden bool) []Commit {
 
 	return commits
 }
+
+func loadCommitsForDate(hidden map[string]bool, showHidden bool, date time.Time) []Commit {
+	if !isGitRepo() {
+		return nil
+	}
+
+	email := gitUserEmail()
+	if email == "" {
+		return nil
+	}
+
+	loc := time.Now().Location()
+	since := time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, loc)
+	until := since.Add(24 * time.Hour)
+
+	cmd := exec.Command("git", "log", "--all",
+		"--author="+email,
+		"--since="+since.Format("2006-01-02T15:04:05"),
+		"--until="+until.Format("2006-01-02T15:04:05"),
+		"--format=%h %s",
+	)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil
+	}
+
+	var commits []Commit
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if line == "" {
+			continue
+		}
+		parts := strings.SplitN(line, " ", 2)
+		hash := parts[0]
+		subject := ""
+		if len(parts) > 1 {
+			subject = parts[1]
+		}
+
+		isHidden := hidden[hash]
+		if isHidden && !showHidden {
+			continue
+		}
+
+		commits = append(commits, Commit{
+			Hash:    hash,
+			Subject: subject,
+			Hidden:  isHidden,
+		})
+	}
+
+	return commits
+}

@@ -21,6 +21,7 @@ const (
 	modeLinearClientSecret
 	modeLinearAuth
 	modeLinearMenu
+	modeCalendar
 )
 
 // doneItem represents an item in the Done pane's unified list.
@@ -37,7 +38,7 @@ type model struct {
 	linearIssues  []LinearIssue
 	hiddenCommits map[string]bool
 	showHidden    bool
-	pane          int // 0 = task, 1 = done, 2 = linear
+	pane          int // 0 = task, 1 = done, 2 = linear, 3 = summary
 	taskCursor    int
 	doneCursor    int
 	linearCursor  int
@@ -46,6 +47,9 @@ type model struct {
 	linearInput   textinput.Model
 	linearStatus  string
 	linearMenuIdx int
+	viewDate      time.Time // the date being viewed (today or a past date)
+	calendarDate  time.Time // the cursor position in the calendar modal
+	snapshot      bool      // true when viewing a past date (read-only)
 	width         int
 	height        int
 	err           error
@@ -66,6 +70,8 @@ func newModel(db *sql.DB, tasks []Task, commits []Commit, hidden map[string]bool
 		commits:       commits,
 		linearIssues:  issues,
 		hiddenCommits: hidden,
+		viewDate:      time.Now(),
+		calendarDate:  time.Now(),
 		input:         ti,
 		linearInput:   li,
 	}
@@ -196,6 +202,62 @@ func (m model) summaryText() string {
 	return sb.String()
 }
 
+func (m model) isToday() bool {
+	now := time.Now()
+	return m.viewDate.Year() == now.Year() && m.viewDate.YearDay() == now.YearDay()
+}
+
+// loadDataForDate loads tasks and commits for a specific date.
+func (m *model) loadDataForDate(date time.Time) {
+	m.viewDate = date
+	tasks, err := loadTasksForDate(m.db, date)
+	if err != nil {
+		m.err = err
+		return
+	}
+	m.tasks = tasks
+	m.taskCursor = 0
+	m.doneCursor = 0
+
+	now := time.Now()
+	isToday := date.Year() == now.Year() && date.YearDay() == now.YearDay()
+	m.snapshot = !isToday
+
+	if isToday {
+		hidden, err := loadHiddenCommits(m.db)
+		if err == nil {
+			m.hiddenCommits = hidden
+		}
+		m.commits = loadCommits(m.hiddenCommits, m.showHidden)
+	} else {
+		m.commits = loadCommitsForDate(m.hiddenCommits, m.showHidden, date)
+	}
+}
+
+// daysWithActivity returns a set of days in the given month that have tasks.
+func (m model) daysWithActivity(year int, month time.Month) map[int]bool {
+	start := time.Date(year, month, 1, 0, 0, 0, 0, time.Now().Location())
+	end := start.AddDate(0, 1, 0)
+	active := make(map[int]bool)
+
+	rows, err := m.db.Query(
+		"SELECT created_at FROM tasks WHERE created_at >= ? AND created_at < ?",
+		start, end,
+	)
+	if err != nil {
+		return active
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var createdAt time.Time
+		if err := rows.Scan(&createdAt); err == nil {
+			active[createdAt.Day()] = true
+		}
+	}
+	return active
+}
+
 func (m model) Init() tea.Cmd {
 	return nil
 }
@@ -242,6 +304,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.handleLinearAuthMode(msg)
 		case modeLinearMenu:
 			return m.handleLinearMenuMode(msg)
+		case modeCalendar:
+			return m.handleCalendarMode(msg)
 		default:
 			return m.handleNormalMode(msg)
 		}

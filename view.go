@@ -67,7 +67,7 @@ func (m model) View() string {
 
 	pending := m.pendingTasks()
 	items := m.doneItems()
-	hasLinear := linearIsAuthenticated(m.db)
+	hasLinear := linearIsAuthenticated(m.db) && !m.snapshot
 
 	// Render daylog banner at the top
 	daylogBannerLines := []string{
@@ -113,8 +113,10 @@ func (m model) View() string {
 	valueStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("15")).Bold(true)
 	dateStyle := lipgloss.NewStyle().Foreground(borderColor).Bold(true)
 
-	now := time.Now()
-	dateStr := now.Format("Mon, Jan 2")
+	dateStr := m.viewDate.Format("Mon, Jan 2")
+	if m.snapshot {
+		dateStr += "  " + lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Italic(true).Render("(read-only)")
+	}
 
 	pad := "    "
 	var statsBlock strings.Builder
@@ -155,11 +157,11 @@ func (m model) View() string {
 	}
 	headerBlock := lipgloss.JoinHorizontal(lipgloss.Top, "  "+paddedStats, strings.Repeat(" ", gap), bannerStr)
 
-	isLinearOverlay := m.mode == modeLinearClientID || m.mode == modeLinearClientSecret || m.mode == modeLinearAuth || m.mode == modeLinearMenu
+	isOverlay := m.mode == modeLinearClientID || m.mode == modeLinearClientSecret || m.mode == modeLinearAuth || m.mode == modeLinearMenu || m.mode == modeCalendar
 
 	colWidth := m.width / 2
 	var availableHeight int
-	if isLinearOverlay {
+	if isOverlay {
 		availableHeight = m.height - 1
 	} else {
 		availableHeight = m.height - 1 - bannerHeight
@@ -381,15 +383,21 @@ func (m model) View() string {
 		}
 		menuBody.WriteString("\n" + helpStyle.Render("enter: select • esc: cancel"))
 		columns = renderPanelWithBanner("Linear", linearBanner, menuBody.String(), m.width, availableHeight)
+	case modeCalendar:
+		calBody := m.renderCalendar()
+		columns = renderPanelCentered("Go to Date", calBody, m.width, availableHeight, true)
 	}
 
 	// Build help bar
 	var helpParts []string
-	helpParts = append(helpParts, "a: add", "space/enter: toggle", "d: delete/hide", "r: refresh", "u: show hidden", "c: copy", "j/k: nav")
+	helpParts = append(helpParts, "a: add", "space/enter: toggle", "d: delete/hide", "r: refresh", "u: show hidden", "c: copy", "g: go to date", "j/k: nav")
 	if hasLinear {
 		helpParts = append(helpParts, "o: open", "1/2/3/4: pane", "L: Linear")
 	} else {
 		helpParts = append(helpParts, "1/2/3: pane", "L: link Linear")
+	}
+	if m.snapshot {
+		helpParts = append(helpParts, "esc: back to today")
 	}
 	helpParts = append(helpParts, "q: quit")
 	help := helpStyle.Render(" " + strings.Join(helpParts, " • "))
@@ -398,10 +406,103 @@ func (m model) View() string {
 		help += "  " + lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Render(fmt.Sprintf("Error: %v", m.err))
 	}
 
-	if isLinearOverlay {
+	if isOverlay {
 		return columns + "\n" + help
 	}
 	return headerBlock + "\n\n" + columns + "\n" + help
+}
+
+func (m model) renderCalendar() string {
+	cd := m.calendarDate
+	year, month, _ := cd.Date()
+	loc := cd.Location()
+	now := time.Now()
+
+	// Header
+	header := lipgloss.NewStyle().Bold(true).Foreground(borderColor).Render(
+		fmt.Sprintf("%s %d", month.String(), year),
+	)
+
+	// Day of week header
+	dowHeader := helpStyle.Render("Mo Tu We Th Fr Sa Su")
+
+	// Find days with activity
+	active := m.daysWithActivity(year, month)
+
+	// First day of month
+	first := time.Date(year, month, 1, 0, 0, 0, 0, loc)
+	// Weekday offset (Monday = 0)
+	offset := int(first.Weekday())
+	if offset == 0 {
+		offset = 6 // Sunday
+	} else {
+		offset--
+	}
+	daysInMonth := time.Date(year, month+1, 0, 0, 0, 0, 0, loc).Day()
+
+	selectedDay := cd.Day()
+	todayDay := -1
+	if now.Year() == year && now.Month() == month {
+		todayDay = now.Day()
+	}
+
+	var grid strings.Builder
+	// Pad first week
+	for i := 0; i < offset; i++ {
+		grid.WriteString("   ")
+	}
+
+	for day := 1; day <= daysInMonth; day++ {
+		dayStr := fmt.Sprintf("%2d", day)
+
+		isFuture := time.Date(year, month, day, 23, 59, 59, 0, loc).After(now)
+
+		if day == selectedDay {
+			// Cursor
+			dayStr = lipgloss.NewStyle().Bold(true).Reverse(true).Foreground(borderColor).Render(dayStr)
+		} else if day == todayDay {
+			dayStr = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("14")).Render(dayStr)
+		} else if isFuture {
+			dayStr = lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render(dayStr)
+		} else if active[day] {
+			dayStr = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15")).Render(dayStr)
+		} else {
+			dayStr = lipgloss.NewStyle().Foreground(lipgloss.Color("8")).Render(dayStr)
+		}
+
+		grid.WriteString(dayStr)
+
+		col := (offset + day - 1) % 7
+		if col == 6 {
+			// Pad line to full grid width (20 visual chars for "Mo Tu We Th Fr Sa Su")
+			lineW := lipgloss.Width(grid.String()[strings.LastIndex(grid.String(), "\n")+1:])
+			if lineW < 20 {
+				grid.WriteString(strings.Repeat(" ", 20-lineW))
+			}
+			if day < daysInMonth {
+				grid.WriteString("\n")
+			}
+		} else if day < daysInMonth {
+			grid.WriteString(" ")
+		}
+	}
+
+	// Pad the last line to full width
+	lastNewline := strings.LastIndex(grid.String(), "\n")
+	var lastLine string
+	if lastNewline == -1 {
+		lastLine = grid.String()
+	} else {
+		lastLine = grid.String()[lastNewline+1:]
+	}
+	lastLineW := lipgloss.Width(lastLine)
+	if lastLineW < 20 {
+		grid.WriteString(strings.Repeat(" ", 20-lastLineW))
+	}
+
+	help := helpStyle.Render("h/l: day • j/k: week • H/L: month • enter: select • esc: cancel")
+
+	return fmt.Sprintf("%s\n%s\n%s\n\n%s", header, dowHeader, grid.String(), help)
 }
 
 func renderPanel(title string, content string, width, height int, focused bool) string {

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"time"
+
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -68,6 +70,9 @@ func (m model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case "a":
+		if m.snapshot {
+			break
+		}
 		m.pane = 0
 		m.mode = modeInput
 		m.input.Reset()
@@ -100,6 +105,9 @@ func (m model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case " ", "enter":
+		if m.snapshot {
+			break
+		}
 		if m.pane == 0 && len(pending) > 0 {
 			task := pending[m.taskCursor]
 			idx := m.findTaskIndex(task.ID)
@@ -167,6 +175,9 @@ func (m model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case "d":
+		if m.snapshot {
+			break
+		}
 		if m.pane == 0 && len(pending) > 0 {
 			task := pending[m.taskCursor]
 			idx := m.findTaskIndex(task.ID)
@@ -214,6 +225,17 @@ func (m model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.pane == m.summaryPaneIndex() {
 			text := m.summaryText()
 			copyToClipboard(text)
+		}
+
+	case "g":
+		m.calendarDate = m.viewDate
+		m.mode = modeCalendar
+
+	case "esc":
+		if m.snapshot {
+			m.loadDataForDate(time.Now())
+			m.snapshot = false
+			m.pane = 0
 		}
 	}
 
@@ -264,6 +286,40 @@ func (m model) startLinearOAuth() tea.Cmd {
 		token, err := linearStartOAuth(m.db)
 		return linearAuthResult{token: token, err: err}
 	}
+}
+
+func (m model) handleCalendarMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.mode = modeNormal
+		return m, nil
+
+	case "enter":
+		m.loadDataForDate(m.calendarDate)
+		m.mode = modeNormal
+		m.pane = 0
+		return m, nil
+
+	case "h":
+		m.calendarDate = m.calendarDate.AddDate(0, 0, -1)
+
+	case "l":
+		m.calendarDate = m.calendarDate.AddDate(0, 0, 1)
+
+	case "k":
+		m.calendarDate = m.calendarDate.AddDate(0, 0, -7)
+
+	case "j":
+		m.calendarDate = m.calendarDate.AddDate(0, 0, 7)
+
+	case "H":
+		m.calendarDate = m.calendarDate.AddDate(0, -1, 0)
+
+	case "L":
+		m.calendarDate = m.calendarDate.AddDate(0, 1, 0)
+	}
+
+	return m, nil
 }
 
 func (m model) handleLinearCredentialMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
