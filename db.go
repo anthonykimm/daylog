@@ -11,7 +11,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const currentSchemaVersion = 5
+const currentSchemaVersion = 6
 
 type Task struct {
 	ID        int
@@ -122,6 +122,20 @@ func migrate(db *sql.DB) error {
 			return err
 		}
 		version = 5
+	}
+
+	if version < 6 {
+		_, err := db.Exec(`
+			CREATE TABLE IF NOT EXISTS summaries (
+				date TEXT PRIMARY KEY,
+				content TEXT NOT NULL
+			);
+			PRAGMA user_version = 6;
+		`)
+		if err != nil {
+			return err
+		}
+		version = 6
 	}
 
 	if version > currentSchemaVersion {
@@ -301,4 +315,21 @@ func isLinearIssueLinked(db *sql.DB, externalID string) bool {
 
 func deleteTaskLink(db *sql.DB, taskID int) {
 	db.Exec("DELETE FROM task_links WHERE task_id = ?", taskID)
+}
+
+func getSummary(db *sql.DB, date string) (string, bool) {
+	var content string
+	err := db.QueryRow("SELECT content FROM summaries WHERE date = ?", date).Scan(&content)
+	if err != nil {
+		return "", false
+	}
+	return content, true
+}
+
+func saveSummary(db *sql.DB, date, content string) error {
+	_, err := db.Exec(
+		"INSERT INTO summaries (date, content) VALUES (?, ?) ON CONFLICT(date) DO UPDATE SET content = ?",
+		date, content, content,
+	)
+	return err
 }

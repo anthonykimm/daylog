@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 )
@@ -22,6 +23,7 @@ const (
 	modeLinearAuth
 	modeLinearMenu
 	modeCalendar
+	modeSummaryEdit
 )
 
 // doneItem represents an item in the Done pane's unified list.
@@ -47,10 +49,14 @@ type model struct {
 	linearInput   textinput.Model
 	linearStatus  string
 	linearMenuIdx int
-	viewDate      time.Time // the date being viewed (today or a past date)
-	calendarDate  time.Time // the cursor position in the calendar modal
-	snapshot      bool      // true when viewing a past date (read-only)
-	width         int
+	viewDate        time.Time // the date being viewed (today or a past date)
+	calendarDate    time.Time // the cursor position in the calendar modal
+	snapshot        bool      // true when viewing a past date (read-only)
+	summaryArea     textarea.Model
+	summaryEdited   bool   // true if user has edited the summary
+	summaryContent  string // the current summary content (edited or auto-generated)
+	lastItemCount   int    // track item count to detect new completions
+	width           int
 	height        int
 	err           error
 	quitting      bool
@@ -64,7 +70,12 @@ func newModel(db *sql.DB, tasks []Task, commits []Commit, hidden map[string]bool
 	li := textinput.New()
 	li.CharLimit = 256
 
-	return model{
+	ta := textarea.New()
+	ta.ShowLineNumbers = false
+	ta.SetWidth(40)
+	ta.SetHeight(10)
+
+	m := model{
 		db:            db,
 		tasks:         tasks,
 		commits:       commits,
@@ -74,7 +85,10 @@ func newModel(db *sql.DB, tasks []Task, commits []Commit, hidden map[string]bool
 		calendarDate:  time.Now(),
 		input:         ti,
 		linearInput:   li,
+		summaryArea:   ta,
 	}
+	m.initSummaryContent()
+	return m
 }
 
 func (m model) pendingTasks() []Task {
@@ -189,7 +203,12 @@ func (m model) summaryItems() []string {
 
 // summaryText builds the full summary string for clipboard.
 func (m model) summaryText() string {
-	header := time.Now().Format("Jan 2") + " Update:"
+	return m.summaryContent
+}
+
+// autoGenerateSummary builds the summary from current state.
+func (m model) autoGenerateSummary() string {
+	header := m.viewDate.Format("Jan 2") + " Update:"
 	items := m.summaryItems()
 	if len(items) == 0 {
 		return header
@@ -200,6 +219,39 @@ func (m model) summaryText() string {
 		sb.WriteString("\n- " + item)
 	}
 	return sb.String()
+}
+
+// initSummaryContent loads persisted summary or auto-generates.
+func (m *model) initSummaryContent() {
+	dateKey := m.viewDate.Format("2006-01-02")
+	if saved, ok := getSummary(m.db, dateKey); ok {
+		m.summaryContent = saved
+		m.summaryEdited = true
+	} else {
+		m.summaryContent = m.autoGenerateSummary()
+		m.summaryEdited = false
+	}
+	m.summaryArea.SetValue(m.summaryContent)
+	m.lastItemCount = len(m.summaryItems())
+}
+
+// refreshSummaryContent appends new items if summary was edited, or regenerates if not.
+func (m *model) refreshSummaryContent() {
+	items := m.summaryItems()
+	newCount := len(items)
+
+	if !m.summaryEdited {
+		m.summaryContent = m.autoGenerateSummary()
+		m.summaryArea.SetValue(m.summaryContent)
+	} else if newCount > m.lastItemCount {
+		// Append only the new items
+		for i := m.lastItemCount; i < newCount; i++ {
+			m.summaryContent += "\n- " + items[i]
+		}
+		m.summaryArea.SetValue(m.summaryContent)
+		saveSummary(m.db, m.viewDate.Format("2006-01-02"), m.summaryContent)
+	}
+	m.lastItemCount = newCount
 }
 
 func (m model) isToday() bool {
@@ -232,6 +284,7 @@ func (m *model) loadDataForDate(date time.Time) {
 	} else {
 		m.commits = loadCommitsForDate(m.hiddenCommits, m.showHidden, date)
 	}
+	m.initSummaryContent()
 }
 
 // daysWithActivity returns a set of days in the given month that have tasks.
@@ -306,6 +359,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.handleLinearMenuMode(msg)
 		case modeCalendar:
 			return m.handleCalendarMode(msg)
+		case modeSummaryEdit:
+			return m.handleSummaryEditMode(msg)
 		default:
 			return m.handleNormalMode(msg)
 		}

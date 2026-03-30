@@ -244,15 +244,17 @@ func (m model) View() string {
 
 	// Build Summary panel content
 	summaryPane := m.summaryPaneIndex()
-	summaryHeader := time.Now().Format("Jan 2") + " Update:"
 	var summaryContent strings.Builder
-	summaryItems := m.summaryItems()
-	summaryContent.WriteString("  " + lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("15")).Render(summaryHeader) + "\n\n")
-	if len(summaryItems) == 0 {
-		summaryContent.WriteString("  No completed items yet.\n")
-	}
-	for _, item := range summaryItems {
-		summaryContent.WriteString("  " + helpStyle.Render("- ") + item + "\n")
+	if m.mode == modeSummaryEdit {
+		summaryContent.WriteString(m.summaryArea.View())
+	} else {
+		// Render the summary content as read-only text
+		for _, line := range strings.Split(m.summaryContent, "\n") {
+			summaryContent.WriteString("  " + line + "\n")
+		}
+		if !m.snapshot {
+			summaryContent.WriteString("\n  " + helpStyle.Render("i: edit • c: copy"))
+		}
 	}
 
 	// Bottom row

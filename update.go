@@ -119,6 +119,7 @@ func (m model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.taskCursor >= len(pending)-1 && m.taskCursor > 0 {
 				m.taskCursor--
 			}
+			m.refreshSummaryContent()
 			// If linked to Linear, mark done there too
 			externalID, _, _ := getTaskLink(m.db, task.ID, "linear")
 			if externalID != "" {
@@ -227,6 +228,13 @@ func (m model) handleNormalMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			copyToClipboard(text)
 		}
 
+	case "i":
+		if m.pane == m.summaryPaneIndex() && !m.snapshot {
+			m.mode = modeSummaryEdit
+			m.summaryArea.Focus()
+			return m, m.summaryArea.Cursor.BlinkCmd()
+		}
+
 	case "g":
 		m.calendarDate = m.viewDate
 		m.mode = modeCalendar
@@ -286,6 +294,21 @@ func (m model) startLinearOAuth() tea.Cmd {
 		token, err := linearStartOAuth(m.db)
 		return linearAuthResult{token: token, err: err}
 	}
+}
+
+func (m model) handleSummaryEditMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if msg.String() == "esc" {
+		m.summaryContent = m.summaryArea.Value()
+		m.summaryEdited = true
+		m.summaryArea.Blur()
+		m.mode = modeNormal
+		saveSummary(m.db, m.viewDate.Format("2006-01-02"), m.summaryContent)
+		return m, nil
+	}
+
+	var cmd tea.Cmd
+	m.summaryArea, cmd = m.summaryArea.Update(msg)
+	return m, cmd
 }
 
 func (m model) handleCalendarMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
